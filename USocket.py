@@ -2,7 +2,7 @@ from socket import socket, AF_INET, SOCK_DGRAM, inet_aton, inet_ntoa
 import time
 
 sockets = {}
-network = ('', -1)
+network = ('127.0.0.1', 12345)
 
 def bytes_to_addr(bytes):
     return inet_ntoa(bytes[:4]), int.from_bytes(bytes[4:8], 'big')
@@ -30,7 +30,7 @@ class UnreliableSocket:
     def bind(self, address:(str, int)):
         sockets[id(self)].bind(address)
         
-    def recvfrom(self, bufsize)->bytes:
+    def recvfrom(self, bufsize):
         data, frm = sockets[id(self)].recvfrom(bufsize)
         addr = bytes_to_addr(data[:8])
         if frm==network:
