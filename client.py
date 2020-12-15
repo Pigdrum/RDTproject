@@ -13,6 +13,7 @@ if __name__ == '__main__':
             break
         else:
             socket.send(inputData.encode())
+
             data = socket.recv(2048)
             print("回显是："+data.decode())
     socket.close()

@@ -1,8 +1,10 @@
+import socket
 import struct
 
 from USocket import UnreliableSocket
 import threading
 import time
+from queue import PriorityQueue
 
 
 # 还剩close，checksum
@@ -32,18 +34,48 @@ class RDTSocket(UnreliableSocket):
         #############################################################################
         # 都是对方的地址
         self.sourceAddr = 0
+        self.mss = 1024
+
+        self.lastByteRead = 0
         self.recv_base = 0
         self.recvBuf = {}
-        self.header = Header()
+
+        self.estimatedRTT = 0
+        self.devRTT = 0
+
+        self.window_size = 100
         self.send_base = 0
-        self.sender_queue = {}
+        self.send_message = {}
+        self.send_queue = PriorityQueue()
         # 序列号长度
         self.SEQLEN = 4294967295
-        #记录本次发送完成data的seq，方便接收ack时使用
-        self.seq_after_send=0
+        # 记录本次发送完成data的seq，方便接收ack时使用
+        self.nextSeqNum = 0
+
+        self._beginSend = False
+
+        self._isEnd = False
+        self.timer = None
         #############################################################################
         #                             END OF YOUR CODE                              #
         #############################################################################
+
+    def _beginTimer(self):
+        self.timer = threading.Timer(3, self.__timeoutEvent__)
+        self.timer.start()
+
+    def __timeoutEvent__(self):
+        seg = self.send_queue.queue[self.send_base]
+        self._send_to(seg[0]+seg[1], self.sourceAddr)
+        self._beginTimer()
+
+    def __recvACKEvent__(self):
+        while (not self._isEnd):
+            self.wait_ack()
+
+    def __begin_loop__(self):
+        t3 = threading.Thread(target=self.__recvACKEvent__)
+        t3.start()
 
     def accept(self):  # ->(RDTSocket, (str, int)):
         """
@@ -56,17 +88,17 @@ class RDTSocket(UnreliableSocket):
         """
         conn, addr = RDTSocket(self._rate), None
         while (1):
-            # 接受syn报文
+            # 2.接受syn报文
             recv_header, data, addr = self._recv_from(1024)
             print("syn接受成功")
             if (recv_header.checkChecksum() and recv_header.syn == 1):
                 conn.recv_base = recv_header.seq + 1
+                conn.lastByteRead = conn.recv_base
                 ################### 使用新的conn发送syn_ack报文############
 
                 conn._sendSYNACK(addr, recv_header.seq)
                 break
-        conn.settimeout(10)
-        # 接受ack报文
+        # 4.接受ack报文
         while (1):
             # 接受ack报文
             try:
@@ -74,13 +106,15 @@ class RDTSocket(UnreliableSocket):
             except TimeoutError as e:
                 return self.accept()
             if (recv_header.checkChecksum() and recv_header.ack == 1 and recv_header.seqack == self.send_base + 1):
+                conn.recv_base = recv_header.seq + 1
+                conn.lastByteRead = conn.recv_base
                 break
         print("syn接受成功-----")
         conn.sourceAddr = addr
         conn.send_base += 1
-
-        self.printState()
+        conn.__begin_loop__()
         print("success accept")
+        print(conn)
         return conn, addr
 
     def connect(self, address: (str, int)):
@@ -91,18 +125,21 @@ class RDTSocket(UnreliableSocket):
         #### 1.发送syn报文
         self._sendSYN(address)
         print("syn发送成功-----" + str(address))
-        print("发送的seq是:" + str(self.header.seq))
-        #### 2.等待syn_ack报文
+
+        #### 3.等待syn_ack报文
         while (1):
             recv_header, data, addr = self._recv_from(1024)
             if (not recv_header.checkChecksum()):
                 continue
             if (recv_header.syn == 1 and recv_header.ack == 1 and recv_header.seqack == self.send_base + 1):
                 self.recv_base = recv_header.seq + 1
+                self.lastByteRead = self.recv_base
+                self.send_base += 1
                 ### 3.发送ack，建立连接
                 self._sendThree(recv_header.seq)
                 break
         print("syn ack 接受成功-----")
+        self.__begin_loop__()
 
     def recv(self, bufsize: int) -> bytes:
         """
@@ -115,112 +152,138 @@ class RDTSocket(UnreliableSocket):
         it MUST NOT affect the data returned by this function.
         """
         print("开始接收")
-        self.printState()
-        self.settimeout(None)
         assert self._recv_from, "Connection not established yet. Use recvfrom instead."
         #############################################################################
         # TODO: YOUR CODE HERE                                                      #
         #############################################################################
+        returnData = b''
         while (1):
-            recv_header, payload, addr = self._recv_from(bufsize)
-            if (addr != self.sourceAddr):
-                continue
+            #先从缓存中读取数据
+            i = self.lastByteRead
+            while (self.recvBuf.get(self.lastByteRead)):
+                if (len(returnData) + len(self.recvBuf) > bufsize):
+                    return returnData
+                returnData += self.recvBuf[i]
+                self.recvBuf.pop(self.lastByteRead)
+                i = i + len(returnData)
+            self.lastByteRead = i
+            if returnData != b'':
+                return returnData
+            #如果缓存中没有数据，则接受数据
+            if(self.send_base!=self.nextSeqNum):
+                self.settimeout(0.5)
             else:
-                print("接收到的报文头")
-                recv_header.printState()
-                if (not recv_header.checkChecksum()):
+                self.settimeout(None)
+            try:
+                recv_header, payload, addr = self._recv_from(bufsize)
+                print("接受到了")
+                if (addr != self.sourceAddr):
                     continue
-                # 序号小于rev_base
-                if (recv_header.seq < self.recv_base):
-                        self._sendACK()
-                elif (recv_header.seq < self.recv_base + self.header.window_size and recv_header.seq >= self.recv_base):
-                    self.header.ack = 1
-                    # 如果缓存里没有，存进去
-                    if not self.recvBuf.get(recv_header.seq):
-                        self.recvBuf[recv_header.seq] = payload
-                    #超前接收了
-                    if (recv_header.seq != self.recv_base):
-                        self._sendACK()
-                    #if seq==recv_base
+                else:
+                    if (not recv_header.checkChecksum()):
+                        continue
+                    if(recv_header.ack==1):
+                        self.recvACK(recv_header)
                     else:
-                        i = self.recv_base
-                        returnData = b''
-                        while (self.recvBuf.get(i)):
-                            returnData += self.recvBuf[i]
-                            self.recvBuf.pop(i)
-                            i = i + len(returnData)
-                        self.recv_base = i
-                        self._sendACK()
-                        return returnData
-
-                    self._sendACK()
+                        self.recvMessage(recv_header, payload)
+            except socket.timeout:
+                pass
 
             #############################################################################
             #                             END OF YOUR CODE                              #
             #############################################################################
+    def recvMessage(self,recv_header,payload):
+        print("接收到的报文头")
+        print(recv_header)
+        print(self)
+        # 序号小于rev_base
+        if (recv_header.seq < self.recv_base):
+            self._sendACK()
+        elif (recv_header.seq < self.recv_base + self.window_size and recv_header.seq >= self.recv_base):
+            # 如果缓存里没有，存进去
+            if not self.recvBuf.get(recv_header.seq):
+                self.recvBuf[recv_header.seq] = payload
+            if (recv_header.seq != self.recv_base):
+                self._sendACK()
+            # if seq==recv_base
+            else:
+                i = self.recv_base
+                returnData = b''
+                while (self.recvBuf.get(i)):
+                    returnData += self.recvBuf[i]
+                    i = i + len(returnData)
+                self.recv_base = i
+                self._sendACK()
+        print(self)
 
     def send(self, bytes: bytes):
         """
         Send data to the socket. 
         The socket must be connected to a remote socket, i.e. self._send_to must not be none.
         """
-        self.seq_after_send = self.send_base+len(bytes)
         self._partition_data(bytes)
-        for _, value in self.sender_queue.items():
-            self._send_to(value, self.sourceAddr)
-            print("send seccuss:")
-            print(value)
-        self.wait_ack()
-        print("收到ack")
-
+        for key, value in self.send_message.items():
+            if (self.timer != None and not self.timer.is_alive()):
+                self._beginTimer()
+            self._send_to(value[0] + value[1], self.sourceAddr)
+            self.nextSeqNum += len(value[1])
+            self.send_queue.put((key, value))
 
     def _partition_data(self, payload: bytes):
         print("开始发送:")
-        self.printState()
         seg_seq_num = self.send_base
         total_len = len(payload)
         remain_len = total_len
         start_index = 0
-        MSS = self.header.mss
+        MSS = self.mss
         while remain_len > MSS:
             partitioned_payload = payload[start_index: start_index + MSS]
             print("partition data: " + partitioned_payload.decode() + ", seq_num: " + str(seg_seq_num))
-            self.header.seq = seg_seq_num
-            self.header.len = MSS
-            partitioned_data_seg = self.header.pack() + partitioned_payload
+            header = Header(self)
+            header.seq = seg_seq_num
+            header.len = MSS
+            partitioned_data_seg = (header.pack(), partitioned_payload)
             seg_seq_num += MSS
             start_index += MSS
             remain_len -= MSS
             # add the segment into the sender queue
-            self.sender_queue[start_index] = (partitioned_data_seg)
+            self.send_message[start_index] = (partitioned_data_seg)
         # add the last segment
         last_data = payload[start_index: total_len]
-        self.header.seq = seg_seq_num
-        self.header.len = total_len - start_index
-        last_data_seg = self.header.pack() + last_data
-        self.sender_queue[start_index] = last_data_seg
+        header = Header(self)
+        header.seq = seg_seq_num
+        header.len = total_len - start_index
+        last_data_seg = (header.pack(), last_data)
+        self.send_message[start_index] = last_data_seg
 
     def wait_ack(self):
-        print("等待接收ack:")
-        self.printState()
-        while True:
-            recv_header, data, addr = self._recv_from(2048)
-            self.settimeout(3)
-            try:
+        while((not self._isEnd)):
+            while ((not self._isEnd) and self.send_base!=self.nextSeqNum):
+
+                recv_header, data, addr = self._recv_from(2048)
+                print("从接受ack处接受到的:")
                 if (addr == self.sourceAddr):
-                    print("收到的ack包")
-                    recv_header.printState()
                     if (not recv_header.checkChecksum()):
                         continue
-                    if recv_header.seqack > self.send_base:
-                        self.send_base = recv_header.seqack
-                        if(self.send_base == self.seq_after_send):
-                            self.sender_queue = {}
-                            # 全部接收完成
-                            break
-            except Exception as e:
-                # 超时重传
-                self._send_to(self.sender_queue[self.send_base], self.sourceAddr)
+                    if(recv_header.ack==1):
+                        self.recvACK(recv_header)
+                    else:
+                        self.recvMessage(recv_header,data)
+
+    def recvACK(self,recv_header):
+        print("收到的ack包")
+        print(recv_header)
+        if recv_header.seqack > self.send_base:
+            self.send_base = recv_header.seqack
+            while (self.send_queue.queue[0][0] < self.send_base):
+                self.send_queue.get()
+            if (self.send_base == self.nextSeqNum):
+                # 全部接收完成
+                if (self.timer != None):
+                    self.timer.cancel()
+            else:
+                self._beginTimer()
+
 
     def close(self):
         """
@@ -242,46 +305,64 @@ class RDTSocket(UnreliableSocket):
     def set_recv_from(self, recv_from):
         self._recv_from = recv_from
 
-    def printState(self):
-        print("syn=" + str(self.header.syn))
-        print("seq=" + str(self.header.seq))
-        print('seqack=' + str(self.header.seqack))
-        print('len=' + str(self.header.len))
-        print('sendbase=' + str(self.send_base))
-        print("recvbase=" + str(self.recv_base))
-
     def _recvData(self, bufferSize):
         data, addr = self.recvfrom(bufferSize)
         self.sourceAddr = addr
-        recv_header = Header()
+        recv_header = Header(self)
         headerLen = recv_header.headerLen()
         recv_header.unpack(data[:headerLen])
         return recv_header, data[headerLen:], addr
 
     def _sendSYN(self, address):
-        self.header.syn = 1
-        self.header.seq = self.send_base
-        self._send_to(self.header.pack(), address)
+        header = Header(self)
+        header.syn = 1
+        header.seq = self.send_base
+        self.nextSeqNum += 1
+        self._send_to(header.pack(), address)
 
     def _sendSYNACK(self, addr, recv_seq):
-        self.header.syn = 1
-        self.header.ack = 1
-        self.header.seqack = recv_seq + 1
-        self.header.seq = self.send_base
-        self._send_to(self.header.pack(), addr)
+        header = Header(self)
+        header.syn = 1
+        header.ack = 1
+        header.seqack = recv_seq + 1
+        header.seq = self.send_base
+        self.nextSeqNum += 1
+        self._send_to(header.pack(), addr)
 
-    def _sendThree(self,recv_seq):
-        self.send_base += 1
-        self.header.syn = 0
-        self.header.seqack = recv_seq + 1
-        self.header.seq = self.send_base
-        self.header.ack = 1
-        self._send_to(self.header.pack(), self.sourceAddr)
+    def _sendThree(self, recv_seq):
+        header = Header(self)
+        self.nextSeqNum += 1
+        header.syn = 0
+        header.seqack = recv_seq + 1
+        header.seq = self.send_base
+        header.ack = 1
+        self._send_to(header.pack(), self.sourceAddr)
+        #假设对方已经收到了
+        self.send_base+=1
 
     def _sendACK(self):
-        self.header.seqack = self.recv_base
-        self.header.ack = 1
-        self._send_to(self.header.pack(), self.sourceAddr)
+        header = Header(self)
+        header.seqack = self.recv_base
+        header.ack = 1
+        self._send_to(header.pack(), self.sourceAddr)
+
+    def __str__(self):
+        to_string = "("
+        items = self.__dict__
+        n = 0
+        for k in items:
+            if k.startswith("_"):
+                continue
+            if (str(k) == 'sendto'):
+                continue
+            if(str(k) == 'send_queue'):
+                to_string = to_string + str(k) + "=" + str(self.send_queue.queue) + ","
+            else:
+                to_string = to_string + str(k) + "=" + str(items[k]) + ","
+            n += 1
+        if n == 0:
+            return ""
+        return to_string.rstrip(",") + ")"
 
 
 """
@@ -290,8 +371,8 @@ You can define additional functions and classes to do thing such as packing/unpa
 """
 
 
-class Header():
-    def __init__(self):
+class Header:
+    def __init__(self, rdtSocket: RDTSocket):
         self.syn = 0
         self.fin = 0
         self.ack = 0
@@ -301,8 +382,8 @@ class Header():
         self.checksum = 0
         self.rwn = 0
         self.cwn = 0
-        self.mss = 100
-        self.window_size = 100
+        self.mss = rdtSocket.mss
+        self.window_size = rdtSocket.window_size
 
     def pack(self):
         flag = self.syn << 3
@@ -331,6 +412,17 @@ class Header():
     def checkChecksum(self):
         return True
 
-    def printState(self):
-        print("seq=" + str(self.seq))
-        print('seqack=' + str(self.seqack))
+    def __str__(self):
+        to_string = "("
+        items = self.__dict__
+        n = 0
+        for k in items:
+            if k.startswith("_"):
+                continue
+            if (str(k) == 'sendto'):
+                continue
+            to_string = to_string + str(k) + "=" + str(items[k]) + ","
+            n += 1
+        if n == 0:
+            return ""
+        return to_string.rstrip(",") + ")"
