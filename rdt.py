@@ -39,11 +39,16 @@ class RDTSocket(UnreliableSocket):
         self.lastByteRead = 0
         self.recv_base = 0
         self.recvBuf = {}
+        self.window_size = 10000000000000
 
+        #-------------超时间隔------------
+        self.timer = None
         self.estimatedRTT = 0
         self.devRTT = 0
-
-        self.window_size = 100
+        self.sampleRTT = 0
+        self.timeoutInterval = 1
+        self.alph = 0.125
+        #--------------------------------
         self.send_base = 0
         self.send_message = {}
         self.send_queue = PriorityQueue()
@@ -52,21 +57,32 @@ class RDTSocket(UnreliableSocket):
         # 记录本次发送完成data的seq，方便接收ack时使用
         self.nextSeqNum = 0
 
-        self._beginSend = False
-
+        # 全局结束标志
         self._isEnd = False
-        self.timer = None
 
+        # 完成结束的发送fin状态
         self._isSendFIN = False
+        # 为了拥塞控制的参数
+        self.duplicateACK = 0
+        self.cwnd = self.mss
+        self.state = 0  # 0代表慢启动，1代表快速恢复，2代表拥塞避免
+        self.ssthresh = 64 * 1024
         #############################################################################
         #                             END OF YOUR CODE                              #
         #############################################################################
 
     def _beginTimer(self):
-        self.timer = threading.Timer(3, self.__timeoutEvent__)
+        self.timer = threading.Timer(self.timeoutInterval, self.__timeoutEvent__)
         self.timer.start()
 
     def __timeoutEvent__(self):
+        # ---------------拥塞控制--------超时事件
+        self.timeoutInterval*=2
+        self.ssthresh = self.cwnd / 2
+        self.cwnd = self.mss
+        self.duplicateACK = 0
+        self.state = 0
+        # ------------------------------------------------#
         seg = self.send_queue.queue[0]
         print("超时重发")
         self._send_to(seg.pack(), self.sourceAddr)
@@ -165,7 +181,7 @@ class RDTSocket(UnreliableSocket):
         In other words, if someone else sends data to you from another address,
         it MUST NOT affect the data returned by this function.
         """
-        #进行动作：从接收队列里取消息，如果无消息，则继续等待消息队列填充消息
+        # 进行动作：从接收队列里取消息，如果无消息，则继续等待消息队列填充消息
         print("开始接收")
         returnData = b''
         while (not self._isEnd):
@@ -173,7 +189,7 @@ class RDTSocket(UnreliableSocket):
             i = self.lastByteRead
             while (self.recvBuf.get(self.lastByteRead)):
                 if (len(returnData) + len(self.recvBuf) > bufsize):
-                    #结束了就不能收数据了
+                    # 结束了就不能收数据了
                     return returnData
                 returnData += self.recvBuf[i]
                 self.recvBuf.pop(self.lastByteRead)
@@ -182,15 +198,19 @@ class RDTSocket(UnreliableSocket):
             if returnData != b'':
                 return returnData
         return b'exit'
+
     def send(self, bytes: bytes):
         """
         Send data to the socket.
         The socket must be connected to a remote socket, i.e. self._send_to must not be none.
         """
-        #进行动作：把消息放入发送队列，发送包
+        # 进行动作：把消息放入发送队列，发送包
         self._partition_data(bytes)
 
         for key, value in self.send_message.items():
+            # 阻塞等待
+            while (self.nextSeqNum - self.send_base > self.cwnd):
+                pass
             if (self.timer != None and not self.timer.is_alive()):
                 self._beginTimer()
             self.send_queue.put(value)
@@ -227,7 +247,7 @@ class RDTSocket(UnreliableSocket):
             self.send_message[start_index] = header
 
     def _beginReceve(self):
-        #执行动作：一直接受，可能是ack消息，可能是fin，可能是message
+        # 执行动作：一直接受，可能是ack消息，可能是fin，可能是message
         while ((not self._isEnd)):
             recv_header, data, addr = self._recv_from(2048)
             print('接收到报文:')
@@ -237,17 +257,35 @@ class RDTSocket(UnreliableSocket):
                     continue
                 if (recv_header.ack == 1):
                     self._recvACK(recv_header)
-                elif(recv_header.fin == 1):
+                elif (recv_header.fin == 1):
                     self._recvFIN(recv_header)
                 else:
                     self._recvMessage(recv_header, data)
 
     def _recvACK(self, recv_header):
-        #执行动作：更新send_base，消息队列出队，如果全部接受完了，则暂停时间，否则重新开始时间
+        # 执行动作：更新send_base，消息队列出队，如果全部接受完了，则暂停时间，否则重新开始时间
         print("收到ack--")
         print(recv_header)
         print(self)
+
         if recv_header.seqack > self.send_base:
+            # ---------------拥塞控制--------收到new ack
+            if self.state == 0:
+                # ------慢启动------
+                self.cwnd += self.mss
+                self.duplicateACK = 0
+                if (self.cwnd >= self.ssthresh):
+                    self.state = 2
+            elif self.state == 1:
+                # ------快速恢复------
+                self.cwnd = self.ssthresh
+                self.duplicateACK = 0
+                self.state = 2
+            elif self.state == 2:
+                # ------拥塞避免------
+                self.cwnd += self.mss * self.mss / self.cwnd
+                self.duplicateACK = 0
+            # ------------------------------------------------#
             self.send_base = recv_header.seqack
             while ((not self.send_queue.empty()) and self.send_queue.queue[0].seq < self.send_base):
                 try:
@@ -262,9 +300,34 @@ class RDTSocket(UnreliableSocket):
                 if (self.timer != None and self.timer.is_alive):
                     self.timer.cancel()
                 self._beginTimer()
+        else:
+            # ---------------拥塞控制--------#收到冗余ack
+            if self.state == 0:
+                self.duplicateACK += 1
+                # ------慢启动------
+                if self.duplicateACK == 3:
+                    self.ssthresh = self.cwnd / 2
+                    self.cwnd = self.ssthresh + 3 * self.mss
+                    self.state = 1
+            elif self.state == 1:
+                self.cwnd += self.mss
+                # ------快速恢复------
+            elif self.state == 2:
+                self.duplicateACK += 1
+                if self.duplicateACK == 3:
+                    self.ssthresh = self.cwnd / 2
+                    self.cwnd = self.ssthresh + 3 * self.mss
+                    self.state = 1
+                # ------拥塞避免------
+            # ------------------------------------------------#
+            if self.duplicateACK == 3:
+                # 快速重传###
+                seg = self.send_queue.queue[0]
+                print("快速重传")
+                self._send_to(seg.pack(), self.sourceAddr)
 
     def _recvMessage(self, recv_header, payload):
-        #接受消息:如果是以前的消息，sendack，否则放进接收队列，如果是recvbase，更新recvbase，如果是大于recvbase,不更新
+        # 接受消息:如果是以前的消息，sendack，否则放进接收队列，如果是recvbase，更新recvbase，如果是大于recvbase,不更新
         print("接收到的报文头")
         print(recv_header)
         # 序号小于rev_base
@@ -286,21 +349,22 @@ class RDTSocket(UnreliableSocket):
                 self.recv_base = i
                 self._sendACK()
 
-    def _recvFIN(self,recv_header):
+    def _recvFIN(self, recv_header):
         print("收到fin")
-        self.recv_base+=recv_header.len
+        self.recv_base += recv_header.len
         self._sendACK()
-        if(self._isSendFIN):
+        if (self._isSendFIN):
             self._isEnd = True
             start = time.time()
-            while(1):
+            while (1):
                 try:
                     self.settimeout(10)
                     if (time.time() - start > 20):
                         break
-                    header,data,addr=self._recv_from(1024)
-                    if(self.sourceAddr == addr and header.checkChecksum() and header.fin==1):
-                        self.recv_base+=1
+                    header, data, addr = self._recv_from(1024)
+                    if (self.sourceAddr == addr and header.checkChecksum() and header.fin == 1):
+                        self.timer.cancel()
+                        self.recv_base += 1
                         self._sendACK()
                 except socket.timeout:
                     pass
@@ -333,13 +397,12 @@ class RDTSocket(UnreliableSocket):
         Finish the connection and release resources. For simplicity, assume that
         after a socket is closed, neither futher sends nor receives are allowed.
         """
-        if(self._isEnd):
+        if (self._isEnd):
             return
         self._isSendFIN = True
         self._sendFIN()
-        while(not self._isEnd):
+        while (not self._isEnd):
             pass
-
 
     def set_send_to(self, send_to):
         self._send_to = send_to
@@ -359,7 +422,7 @@ class RDTSocket(UnreliableSocket):
         header.syn = 1
         header.seq = self.send_base
         self.nextSeqNum += 1
-        self.send_queue.put( header)
+        self.send_queue.put(header)
         self._send_to(header.pack(), address)
         self._beginTimer()
 
@@ -370,7 +433,7 @@ class RDTSocket(UnreliableSocket):
         header.seqack = recv_seq + 1
         header.seq = self.send_base
         self.nextSeqNum += 1
-        self.send_queue.put(header )
+        self.send_queue.put(header)
         self._send_to(header.pack(), addr)
         self._beginTimer()
 
@@ -395,9 +458,9 @@ class RDTSocket(UnreliableSocket):
         header = Header(self)
         header.fin = 1
         header.seq = self.send_base
-        header.payload=b'\0'
-        header.len=1
-        self.nextSeqNum+=1
+        header.payload = b'\0'
+        header.len = 1
+        self.nextSeqNum += 1
         self.send_queue.put(header)
         self._send_to(header.pack(), self.sourceAddr)
         self._beginTimer()
@@ -421,8 +484,6 @@ class RDTSocket(UnreliableSocket):
         return to_string.rstrip(",") + ")"
 
 
-
-
 """
 You can define additional functions and classes to do thing such as packing/unpacking packets, or threading.
 
@@ -438,19 +499,14 @@ class Header:
         self.seqack = 0
         self.len = 0
         self.checksum = 0
-        self.rwn = 0
-        self.cwn = 0
-        self.mss = rdtSocket.mss
-        self.window_size = rdtSocket.window_size
-
-        self.payload=b''
+        self.payload = b''
 
     def pack(self):
         flag = self.syn << 3
         flag += self.fin << 2
         flag += self.ack << 1
         self.calculateChecksum()
-        return struct.pack('!BIIIH', flag, self.seq, self.seqack, self.len, self.checksum)+self.payload
+        return struct.pack('!BIIIH', flag, self.seq, self.seqack, self.len, self.checksum) + self.payload
 
     def unpack(self, b):
         unpacked = struct.unpack('!BIIIH', b)
@@ -487,5 +543,10 @@ class Header:
             return ""
         return to_string.rstrip(",") + ")"
 
-    def __lt__(self,rhs):
-        return self.seq<rhs.seq
+    def __lt__(self, rhs):
+        return self.seq < rhs.seq
+
+    def __eq__(self, other):
+        return (self.seq == other.seq and self.ack == other.ack and self.fin == other.fin and
+                self.syn == other.syn and self.checksum == other.checksum and self.seqack == other.seqack
+                and self.payload == other.payload)
