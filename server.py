@@ -1,3 +1,4 @@
+import time
 
 import rdt
 
@@ -15,3 +16,5 @@ if __name__ == '__main__':
         else:
             conn.close()
             break
+    print('会话正常结束')
+    # time.sleep(1000)
