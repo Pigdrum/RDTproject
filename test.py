@@ -5,8 +5,8 @@ from struct import pack, unpack
 from queue import PriorityQueue
 
 def fun_timer():
-    while(1):
-        print(11111111111)
+    # while(1):
+    print(11111111111)
 
 class tester:
     def __init__(self):
@@ -26,7 +26,19 @@ class tester:
     def runThreader(self):
         t1 = threading.Thread(target=self.threader)
         t1.start()
+
+    def __eq__(self, other):
+        return self.counter == other.counter
+
 if __name__ == "__main__":
+    while True:
+        t = threading.Timer(1,fun_timer)
+        t.start()
+
+        t = threading.Timer(1,fun_timer)
+        t.start()
+        t.cancel()
+    print(tester() == tester())
     syn = 1
     fin = 0
     ack = 1
@@ -39,17 +51,26 @@ if __name__ == "__main__":
     print(c)
     socket = USocket.socket()
 
-    queu = PriorityQueue()
-    queu.put((1,'sadf'))
-    queu.put((2,'sdaf'))
-    print(queu.queue[0])
-    print(queu.queue)
+    start = time.time()
+    print("ss:")
+    time.sleep(1)
+    print(time.time() - start)
 
-    test = tester()
+    # queu = PriorityQueue()
+    # try:
+    #     queu.get_nowait()
+    # except Exception as e:
+    #     pass
+    # queu.put((1,'sadf'))
+    # queu.put((2,'sdaf'))
+    # print(queu.queue[0])
+    # print(queu.queue)
 
-    test.runThreader()
-    test.getCounter()
-    test.other()
+    # test = tester()
+    #
+    # test.runThreader()
+    # test.getCounter()
+    # test.other()
     # timer=None
     # h = {}
     # h[1] = 'awef'
