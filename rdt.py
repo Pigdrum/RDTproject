@@ -457,6 +457,7 @@ class RDTSocket(UnreliableSocket):
         recv_header = Header(self)
         headerLen = recv_header.headerLen()
         recv_header.unpack(data[:headerLen])
+        recv_header.payload = data[headerLen:]
         return recv_header, data[headerLen:], addr
 
     def _sendSYN(self, address):
@@ -548,7 +549,7 @@ class Header:
         flag = self.syn << 3
         flag += self.fin << 2
         flag += self.ack << 1
-        self.calculateChecksum()
+        self.checksum = self.calculateChecksum()
         return struct.pack('!BIIIH', flag, self.seq, self.seqack, self.len, self.checksum) + self.payload
 
     def unpack(self, b):
@@ -566,10 +567,21 @@ class Header:
         return len(self.pack())
 
     def calculateChecksum(self):
-        pass
+        flag = self.syn << 3
+        flag += self.fin << 2
+        flag += self.ack << 1
+        whole_bytes = struct.pack('!BIII', flag, self.seq, self.seqack, self.len)+b'\x00\x00'+self.payload
+        sum = 0
+        for byte in whole_bytes:
+            sum = self.addWithCarry(sum, byte)
+        return (sum & 0xFF)
+
+    def addWithCarry(self, sum, b):
+        sum += b
+        return -(sum % 256)
 
     def checkChecksum(self):
-        return True
+        return self.calculateChecksum() == self.checksum
 
     def __str__(self):
         to_string = "("
