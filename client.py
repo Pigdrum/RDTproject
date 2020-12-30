@@ -1,23 +1,55 @@
+from rdt import RDTSocket
+from socket import socket, AF_INET, SOCK_STREAM
 import time
+from difflib import Differ
 
-from click._compat import raw_input
+if __name__=='__main__':
+    client = RDTSocket()
+    # client = socket(AF_INET, SOCK_STREAM) # check what python socket does
+    client.connect(('127.0.0.1', 9998))
 
-import rdt
+    echo = b''
+    count = 5
+    slice_size = 2048
+    blocking_send = True
 
-if __name__ == '__main__':
-    socket = rdt.RDTSocket()
-    # Creates an IPv4 socket with UDP to listen from r1
-    socket.connect(('127.0.0.1',2223))
-    while True:
-        inputData = input()
-        if(inputData==''):
-            continue
-        else:
-            if (inputData == "exit"):
-                break
-            socket.send(inputData.encode())
-            data = socket.recv(2048)
-            print("回显是："+data.decode())
-    socket.close()
-    print('会话正常结束')
-    # time.sleep(1000)
+    with open('alice.txt', 'r') as f:
+        data = f.read()
+        encoded = data.encode()
+        assert len(data)==len(encoded)
+
+    '''
+    check if your rdt pass either of the two
+    mode A may be significantly slower when slice size is small
+    '''
+    if blocking_send:
+        print('transmit in mode A, send & recv in slices')
+        slices = [encoded[i*slice_size:i*slice_size+slice_size] for i in range(len(encoded)//slice_size+1)]
+        assert sum([len(slice) for slice in slices])==len(encoded)
+
+        start = time.perf_counter()
+        for i in range(count): # send 'alice.txt' for count times
+            for slice in slices:
+                client.send(slice)
+                reply = client.recv(slice_size)
+                echo += reply
+    else:
+        print('transmit in mode B')
+        start = time.perf_counter()
+        for i in range(count):
+            client.send(encoded)
+            while len(echo) < len(encoded)*(i+1):
+                reply = client.recv(slice_size)
+                echo += reply
+
+    client.close()
+
+    '''
+    make sure the following is reachable
+    '''
+
+    print(f'transmitted {len(encoded)*count}bytes in {time.perf_counter()-start}s')
+    diff = Differ().compare((data*count).splitlines(keepends=True), echo.decode().splitlines(keepends=True))
+    for line in diff:
+        if not line.startswith('  '): # check if data is correctly echoed
+            print(line)

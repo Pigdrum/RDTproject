@@ -1,20 +1,24 @@
+from rdt import RDTSocket
+from socket import socket, AF_INET, SOCK_DGRAM, SOCK_STREAM
 import time
 
-import rdt
+if __name__=='__main__':
+    server = RDTSocket()
+    # server = socket(AF_INET, SOCK_STREAM) # check what python socket does
+    server.bind(('127.0.0.1', 9998))
+    # server.listen(0) # check what python socket does
 
-if __name__ == '__main__':
-    # while (1):
-    socket = rdt.RDTSocket()
-
-    socket.bind(('127.0.0.1', 2223))
-    conn,info = socket.accept()
     while True:
-        data = conn.recv(2048)
-        print("收到是：" + data.decode())
-        if data and data !=b'exit':
-            conn.send(data)
-        else:
-            conn.close()
-            break
-    print('会话正常结束')
-    # time.sleep(1000)
+        conn, client_addr = server.accept()
+        start = time.perf_counter()
+        while True:
+            data = conn.recv(2048)
+            if data:
+                conn.send(data)
+            else:
+                break
+        '''
+        make sure the following is reachable
+        '''
+        conn.close()
+        print(f'connection finished in {time.perf_counter()-start}s')
