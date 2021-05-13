@@ -10,6 +10,8 @@ if __name__=='__main__':
 
     while True:
         conn, client_addr = server.accept()
+        # print(conn)
+        # time.sleep(10000000000)
         start = time.perf_counter()
         while True:
             data = conn.recv(2048)
